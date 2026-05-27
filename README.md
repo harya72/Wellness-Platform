@@ -4,60 +4,73 @@ This document outlines the architectural decisions, product assumptions, scalabi
 
 ---
 
-## 1. Stack and Architecture Decisions
+## 1. Stack & Architecture Decisions
 
-The system is built using a decoupled client-server architecture, allowing the mobile application and admin dashboard to scale independently while sharing a unified backend API.
+**Does the suggested stack actually make sense for this product?**
+Yes, the decoupled architecture (React Native, React.js, Node.js + Supabase) is highly appropriate. React Native enables cross-platform mobile delivery, React.js with Vite offers a fast admin dashboard, and Supabase handles real-time sync and media storage effortlessly.
 
-### Mobile App (React Native + Expo)
-- **Framework:** Expo was chosen to rapidly bootstrap the React Native app.
-- **UI & Navigation:** Used standard React Navigation for routing and built custom reusable components for a cohesive, clean user interface.
+**Which parts feel overkill?**
+Using a full custom Node.js/Express backend with Prisma might seem like overkill for a simple CRUD app when Supabase provides auto-generated REST APIs. However, I intentionally chose Node.js because it provides a dedicated, robust environment to securely handle the AI integration, custom data validation, and complex business logic that would be difficult or unsafe to manage entirely on the client side.
 
-### Web Dashboard (React.js + Vite)
-- **Tooling:** Vite was selected for significantly faster hot-module replacement (HMR) and optimized build times compared to older bundlers.
-- **Styling:** Maintained zero-dependency vanilla CSS for complete control over the layout, ensuring the dashboard remains lightweight.
+**Which parts feel insufficient?**
+Relying solely on Supabase Realtime for system-wide events can be insufficient if we need complex background processing (like delayed AI retries or queueing).
 
-### Backend API (Node.js + Express + Prisma)
-- **RESTful API:** Express.js provides a robust, lightweight foundation for routing and middleware.
-- **Database (PostgreSQL & Prisma):** Chose Prisma ORM for database interactions. Prisma provides exceptional type-safety via its auto-generated client and schema migrations. The database itself is a PostgreSQL instance.
-
-### Realtime & Storage Infrastructure (Supabase)
-- **Supabase Realtime:** To fulfill the real-time syncing requirement without maintaining a custom WebSocket server, the system leverages Supabase's Postgres replication channels. This allows the applications to subscribe to database events (like meal deletions or status updates) and reflect live changes instantly.
-- **Supabase Storage:** User-uploaded meal images are piped directly into Supabase Storage buckets, keeping the PostgreSQL database lean.
+**What would you keep or change if this evolved into a real startup product?**
+I would keep the core stack (React Native, React.js, and Node.js) because it provides a scalable, proven foundation. As the product evolves, I would change the Node.js backend architecture from a monolithic Express server to a more scalable, containerized architecture (e.g., using Docker). I would also introduce a message broker (like RabbitMQ or Redis queues) to handle the LLM processing asynchronously, ensuring the main API remains responsive under heavy user load.
 
 ---
 
-## 2. Product Thinking and UX Assumptions
+## 2. Product Thinking
 
-The core product thesis is that users abandon health trackers when logging becomes tedious.
+**What assumptions did you make about the users?**
+I assumed users often abandon health trackers when logging becomes tedious. Therefore, I assumed they would value speed and automation over granular, manual entry.
 
-- **Frictionless Entry:** The mobile app allows users to log a meal using either a simple text description or an image. The AI pipeline abstracts away the manual labor of calculating calories and macronutrients.
-- **Actionable AI Feedback:** Instead of just returning raw macros, the Gemini AI prompt is engineered to provide a short, actionable health insight directly to the user based on their meal.
-- **Live Accountability Loop:** The bidirectional real-time integration ensures that when a mobile user logs a meal, it instantly appears on the admin dashboard. Conversely, when an admin changes a meal's status or adds a comment, the mobile app reflects it immediately.
-- **Proactive Engagement:** The system includes automated reminder notifications to keep users engaged and consistent with their daily logging habits.
+**What UX decisions did you intentionally make?**
+- **Frictionless Entry:** Allowed users to log a meal via a simple image or short text description.
+- **Actionable AI Feedback:** Designed the LLM prompt to return a short, personalized health insight rather than just raw numbers.
 
----
-
-## 3. Scalability Considerations
-
-- **Stateless Authentication (JWT):** The backend utilizes stateless JSON Web Tokens. Since no session data is stored in memory, the backend can be horizontally scaled easily.
-- **Prisma Connection Pooling:** Postgres connections are expensive. Prisma natively handles connection pooling, preventing the database from being overwhelmed by connection timeouts.
-- **Media Offloading:** Storing Base64 images in a relational database destroys performance. By using Supabase Storage, the database only stores lightweight URL strings, ensuring fast queries.
+**What would you improve if given one additional week?**
+I would implement a comprehensive offline-first architecture using a local database (like WatermelonDB) synced with Supabase, ensuring users can log meals even without an internet connection. I would also add data visualization (charts) for weekly macro tracking.
 
 ---
 
-## 4. AI Reliability and Safety (Google Gemini)
+## 3. Scalability & Systems Thinking
 
-Relying on LLMs for deterministic, structured data poses hallucination and syntax risks.
+**What breaks first if the system scales to 100k+ users?**
+The Node.js backend's synchronous handling of AI API calls would become a bottleneck. Keeping HTTP connections open while waiting for Gemini to analyze an image will rapidly consume the server's connection pool, causing timeouts. Supabase Realtime concurrent connection limits could also be hit.
 
-- **Strict JSON Enforcement:** The system uses a highly structured prompt requesting ONLY valid JSON in an exact structure. 
-- **Graceful Error Handling:** The backend intercepts the Gemini response and runs a custom parsing utility that strips markdown code blocks before running `JSON.parse` inside a `try/catch`. If the LLM hallucinates broken JSON, the API returns a clean failure rather than crashing.
-- **Rate Limits & Fallbacks:** AI APIs frequently hit quota limits. The application implements an API key rotation pool in the Gemini service to swap keys automatically if a quota limit is reached.
-- **Out-of-Bounds Rejection:** The prompt includes instructions to return a failure flag if the image or text is completely unrelated to food, preventing the system from calculating calories for unrelated images.
+**How would you redesign the system over time?**
+I would redesign the AI processing pipeline to be strictly asynchronous. The mobile app would upload the image and create a "pending" meal record. The backend would simply acknowledge the upload and pass a job to a queue.
+
+**Where would caching, queues, background workers, or service separation become necessary?**
+- **Queues & Background Workers:** Necessary for AI meal analysis. Instead of analyzing synchronously, a worker would pull from an SQS/RabbitMQ queue to call the Gemini API and then update the database.
+- **Caching:** Redis would be necessary for caching user profiles and frequent queries on the Admin dashboard.
+- **Service Separation:** Separating the AI processing service from the core CRUD API to prevent compute-heavy tasks from affecting basic app responsiveness.
 
 ---
 
-## 5. Technical Tradeoffs and Compromises
+## 4. AI & Reliability
 
-1. **Managed Realtime vs. Custom WebSockets:** I opted to couple the real-time architecture to Supabase's Postgres replication channels. While building a custom Node.js WebSocket infrastructure would allow for more granular control over non-database events, Supabase Realtime drastically accelerated development time and simplified infrastructure.
-2. **LLM Latency:** AI image processing inherently adds a few seconds of latency. I traded immediate synchronous responses for powerful automation. To mitigate the UX impact on the mobile side, the app utilizes non-blocking loading states so it remains responsive while Gemini processes the meal.
-3. **Prisma Query Engine Binary Size:** Prisma utilizes a Rust-based query engine under the hood. While this provides incredible performance and type-safety, it slightly increases the memory footprint of the Node server compared to lighter query builders. I accepted this tradeoff for the boost in developer velocity and safety.
+**Risks of relying on LLM-generated outputs in a wellness product:**
+The primary risks are hallucinations (providing dangerous nutritional advice or wildly inaccurate calories) and format inconsistency (breaking the JSON parser on the backend).
+
+**How you would improve Reliability, Consistency, Safety:**
+- **Reliability & Consistency:** Use strict structured output generation. Validate the LLM output against a Zod schema before saving to the database. Implement a retry mechanism with exponential backoff if the AI fails.
+- **Safety:** Include explicit system prompts commanding the AI to reject non-food images and refrain from giving medical advice.
+
+**What strategies you would use to reduce AI cost and latency:**
+- **Caching LLM Results:** Hash the meal descriptions/images. If a user logs "1 cup of black coffee" today, we can retrieve the cached macros from yesterday instead of calling the API.
+- **Model Tiering:** Use a smaller, cheaper, and faster model (like Gemini Flash) for text-only descriptions, and only use the larger multimodal models when image analysis is required.
+
+---
+
+## 5. Technical Tradeoffs
+
+**One shortcut you intentionally took:**
+Coupled the real-time architecture directly to Supabase's Postgres replication channels instead of building a custom WebSocket service. This accelerated development but ties the real-time logic closely to database changes.
+
+**One engineering compromise you disagree with:**
+Storing unstructured AI insights directly in the main `meals` table. Ideally, AI outputs and raw logs should be separated (e.g., a `meal_analyses` table) so we can easily recalculate or drop AI data without touching the canonical user entry.
+
+**One aspect of the implementation you are particularly proud of:**
+The graceful error handling around the LLM integration. By anticipating AI format failures, stripping markdown, and gracefully catching parsing errors, the system ensures the mobile app doesn't crash when the AI hallucinates.
